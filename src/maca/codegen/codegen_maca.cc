@@ -29,6 +29,13 @@ using namespace ffi;
 
 namespace {
 
+bool IsProvablyDivisible(const PrimExpr &expr, int64_t divisor) {
+  ICHECK_GT(divisor, 0);
+  arith::Analyzer analyzer;
+  arith::ModularSet modular_set = analyzer.modular_set(expr);
+  return modular_set->coeff % divisor == 0 && modular_set->base % divisor == 0;
+}
+
 bool CanEmitPackedX2MathMACA(DataType t) {
   int lanes = t.lanes();
   if (lanes < 2 || lanes % 2 != 0) {
@@ -422,6 +429,9 @@ std::string CodeGenTileLangMACA::Finish() {
   if (enable_fp8_) {
     decl_stream << "#include <tl_templates/maca/maca_fp8.h>\n";
   }
+  if (need_math_h_) {
+    decl_stream << "#include <tl_templates/maca/math.h>\n";
+  }
   if (enable_fp4_) {
     decl_stream << "#include <tl_templates/maca/maca_fp4.h>\n";
   }
@@ -676,6 +686,11 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
           os << "char";
         }
         return;
+      } else if (t.lanes() == 2) {
+        // Two packed 4-bit lanes occupy exactly one byte.
+        enable_int8_ = true;
+        os << "int8_t";
+        return;
       } else if (t.lanes() == 4) {
         os << "int16_t";
         return;
@@ -806,6 +821,15 @@ void CodeGenTileLangMACA::PrintType(DataType t, std::ostream &os) { // NOLINT(*)
     }
   }
   LOG(FATAL) << "Cannot convert type " << t << " to MACA type";
+}
+
+void CodeGenTileLangMACA::PrintVecConstructor(DataType t,
+                                              std::ostream &os) { // NOLINT(*)
+  if ((t.is_int() || t.is_uint()) && t.bits() == 4 && t.lanes() == 2) {
+    os << (t.is_uint() ? "tl_pack_uint4x2" : "tl_pack_int4x2");
+    return;
+  }
+  CodeGenC::PrintVecConstructor(t, os);
 }
 
 void CodeGenTileLangMACA::PrintVecBinaryOp(const std::string &op, DataType t,
@@ -1017,12 +1041,23 @@ void CodeGenTileLangMACA::PrintVecElemLoad(const std::string &vec, DataType t,
   }
 
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
-                        : (t.lanes() == 16)                  ? 16
-                        : (t.lanes() == 32)                  ? 32
-                        : (t.bits() == 16 || t.bits() == 32) ? 8
-                                                             : 4));
-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+  ICHECK(i >= 0 && i < 256 / t.bits())
+      << "i: " << i << " t: " << t << " t.bits(): " << t.bits()
+      << " t.lanes(): " << t.lanes();
+  bool is_packed_int4 = t.bits() == 4 && (t.is_int() || t.is_uint());
+  if (is_packed_int4) {
+    std::ostringstream packed_byte;
+    packed_byte << "((const unsigned char*)(&(" << vec << ")))[" << i / 2
+                << "]";
+    int shift = i % 2 * 4;
+    if (t.is_uint()) {
+      os << "((static_cast<unsigned int>(" << packed_byte.str() << ") >> "
+         << shift << ") & 0x0fu)";
+    } else {
+      os << "((static_cast<int>((static_cast<unsigned int>("
+         << packed_byte.str() << ") >> " << shift << ") & 0x0fu) ^ 8) - 8)";
+    }
+  } else if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     std::string type_name = t.is_int() ? "char" : "unsigned char";
     if (t.lanes() == 2 || t.lanes() == 3) {
       os << vec << "." << access[i % t.lanes()];
@@ -1114,12 +1149,21 @@ void CodeGenTileLangMACA::PrintVecElemStore(const std::string &vec, DataType t,
                                             int i, const std::string &value) {
   this->PrintIndent();
   static const char access[] = {'x', 'y', 'z', 'w'};
-  ICHECK(i >= 0 && i < (t.bits() == 8                        ? 16
-                        : (t.lanes() == 16)                  ? 16
-                        : (t.lanes() == 32)                  ? 32
-                        : (t.bits() == 16 || t.bits() == 32) ? 8
-                                                             : 4));
-  if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
+  ICHECK(i >= 0 && i < 256 / t.bits());
+  bool is_packed_int4 = t.bits() == 4 && (t.is_int() || t.is_uint());
+  if (is_packed_int4) {
+    std::ostringstream packed_byte;
+    packed_byte << "((unsigned char*)(&(" << vec << ")))[" << i / 2 << "]";
+    stream << packed_byte.str() << " = ";
+    // Packed vector temporaries are initialized in ascending lane order.
+    // Each even lane starts a new byte; each odd lane preserves the low
+    // nibble written immediately before it.
+    if (i % 2 != 0) {
+      stream << "(" << packed_byte.str() << " & 0x0fu) | ";
+    }
+    stream << "((static_cast<unsigned int>(" << value << ") & 0x0fu) << "
+           << i % 2 * 4 << ");\n";
+  } else if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (t.lanes() == 2 || t.lanes() == 3) {
       stream << vec << '.' << access[i % t.lanes()] << "="
              << "(" << value << ");\n";
@@ -1127,7 +1171,7 @@ void CodeGenTileLangMACA::PrintVecElemStore(const std::string &vec, DataType t,
       std::string ac = t.lanes() == 4 ? vec : (vec + "." + access[i / 4]);
       stream << ac << "=";
       // Do not read the first undef lane.
-      if (i != 0) {
+      if (i % 4 != 0) {
         stream << ac << " & ~(0x000000ff << " << i % 4 * 8 << ") |";
       }
       stream << "(" << value << " << " << i % 4 * 8 << ");\n";
@@ -1136,10 +1180,12 @@ void CodeGenTileLangMACA::PrintVecElemStore(const std::string &vec, DataType t,
       std::string ac = vec + "." + access[i / 8];
       stream << ac << "=";
       // Do not read the first undef lane.
-      if (i != 0) {
-        stream << ac << " & ~(0x000000ff << " << i % 8 * 8 << ") |";
+      if (i % 8 != 0) {
+        stream << ac << " & ~(static_cast<unsigned long long>(0x000000ffu) << "
+               << i % 8 * 8 << ") |";
       }
-      stream << "(" << value << " << " << i % 8 * 8 << ");\n";
+      stream << "((static_cast<unsigned long long>(" << value
+             << ") & 0xffULL) << " << i % 8 * 8 << ");\n";
     }
   } else if ((t.lanes() == 16 || t.lanes() == 32) && t.bits() == 32 &&
              t.is_float()) {
@@ -1786,8 +1832,8 @@ std::string CodeGenTileLangMACA::GetBufferRef(DataType t,
   std::ostringstream os;
   std::string vid = GetVarID(buffer_var);
   // For fp4 packed buffers, use the packed buffer name for vector accesses
-  auto it = fp4_packed_buffers_.find(buffer_var);
-  if (it != fp4_packed_buffers_.end() && !t.is_scalar()) {
+  auto it = fp4_packed_buffers_.find(buffer->data);
+  if (it != fp4_packed_buffers_.end()) {
     vid = it->second;
   }
   std::string scope;
@@ -2606,6 +2652,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::__exp())) {
     MACAFastMath math_func;
     std::string func_name = math_func(op->dtype, "exp");
+    need_math_h_ = true;
     os << func_name << "(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::__exp10())) {
     MACAFastMath math_func;
@@ -2614,6 +2661,7 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::__log())) {
     MACAFastMath math_func;
     std::string func_name = math_func(op->dtype, "log");
+    need_math_h_ = true;
     os << func_name << "(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::__log2())) {
     MACAFastMath math_func;
@@ -2630,10 +2678,12 @@ void CodeGenTileLangMACA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::__cos())) {
     MACAFastMath math_func;
     std::string func_name = math_func(op->dtype, "cos");
+    need_math_h_ = true;
     os << func_name << "(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::__sin())) {
     MACAFastMath math_func;
     std::string func_name = math_func(op->dtype, "sin");
+    need_math_h_ = true;
     os << func_name << "(" << PrintExpr(op->args[0]) << ")";
   } else if (op->op.same_as(tl::ieee_add())) {
     MACAIEEEMath math_func;
@@ -3180,7 +3230,7 @@ void CodeGenTileLangMACA::VisitStmt_(const AllocBufferNode *op) {
           auto vid_packed = vid + "_packed";
           stream << "fp4_e2_2_t " << vid_packed << '['
                  << (constant_size + 1) / 2 << "];\n";
-          fp4_packed_buffers_[op->buffer->data.get()] = vid_packed;
+          fp4_packed_buffers_[op->buffer->data] = vid_packed;
         } else {
           stream << ' ' << vid << '[' << constant_size << "];\n";
         }
@@ -3226,8 +3276,15 @@ void CodeGenTileLangMACA::VisitStmt_(const EvaluateNode *op) {
 
 void CodeGenTileLangMACA::VisitExpr_(const RampNode *op, std::ostream &os) {
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
-  os << "(make_";
-  PrintType(op->dtype, os);
+  bool is_packed_int4x2 = (op->dtype.is_int() || op->dtype.is_uint()) &&
+                          op->dtype.bits() == 4 && op->dtype.lanes() == 2;
+  os << "(";
+  if (is_packed_int4x2) {
+    PrintVecConstructor(op->dtype, os);
+  } else {
+    os << "make_";
+    PrintType(op->dtype, os);
+  }
   os << "(";
   for (int i = 0; i < lanes; i++) {
     os << "(" << PrintExpr(op->base) << ")"
@@ -3250,6 +3307,39 @@ void CodeGenTileLangMACA::VisitExpr_(const BufferLoadNode *op,
   Var buffer_var = op->buffer->data;
   DataType element_dtype = op->buffer->dtype;
 
+  const bool is_packed_int4_buffer = (element_dtype == DataType::Int(4) ||
+                                      element_dtype == DataType::UInt(4)) &&
+                                     element_dtype.is_scalar();
+  const bool is_packed_int4_vector = is_packed_int4_buffer &&
+                                     value_dtype.lanes() > 1 &&
+                                     value_dtype.element_of() == element_dtype;
+  const bool is_packed_int4x2 =
+      is_packed_int4_vector && value_dtype.lanes() == 2;
+
+  std::string vid = GetVarID(buffer_var.get());
+  auto print_packed_int4_load = [&](const std::string &idx_str,
+                                    std::ostream &stream) {
+    if (element_dtype.is_uint()) {
+      stream << "tl_uint4_packed_load((const unsigned char*)" << vid << ", "
+             << idx_str << ")";
+    } else {
+      stream << "tl_int4_packed_load((const signed char*)" << vid << ", "
+             << idx_str << ")";
+    }
+  };
+
+  if (is_packed_int4_buffer && value_dtype.is_scalar()) {
+    print_packed_int4_load(PrintExpr(index), os);
+    return;
+  }
+
+  // Check if this is a fp4 packed buffer access
+  auto packed_it = fp4_packed_buffers_.find(buffer_var);
+  if (packed_it != fp4_packed_buffers_.end() && value_dtype.is_scalar()) {
+    std::string idx_str = PrintExpr(index);
+    os << "tl_fp4_packed_load(" << packed_it->second << ", " << idx_str << ")";
+    return;
+  }
   int lanes = op->dtype.lanes();
   // declare type.
   if (value_dtype.lanes() == element_dtype.lanes()) {
@@ -3258,7 +3348,7 @@ void CodeGenTileLangMACA::VisitExpr_(const BufferLoadNode *op,
     // GetBufferRef maps two consecutive fp4 elements to the same byte, but
     // reading that byte only returns the low nibble — the odd-indexed element
     // is lost).
-    if (element_dtype.is_float4() && element_dtype.lanes() == 1) {
+    if (element_dtype.is_float4_e2m1fn() && element_dtype.lanes() == 1) {
       std::string idx_str = PrintExpr(index);
       std::string vid = GetVarID(buffer_var.get());
       os << "tl_fp4_packed_load((fp4_e2_2_t*)" << vid << ", " << idx_str << ")";
@@ -3271,43 +3361,81 @@ void CodeGenTileLangMACA::VisitExpr_(const BufferLoadNode *op,
     arith::PVar<PrimExpr> base;
     int ramp_lanes = value_dtype.lanes() / element_dtype.lanes();
     if (arith::ramp(base, 1, ramp_lanes).Match(index)) {
-      const RampNode *ramp = index.as<RampNode>();
-      ICHECK(ramp);
       can_vector_load = true;
-      // arith::ModularSet me = arith::Analyzer().modular_set(ramp->base);
-      // The condition: {k * coeff + base} divisible by the alignment for any k
-      // if (me->coeff % op->dtype.lanes() == 0 && me->base % op->dtype.lanes()
-      // == 0) {
-      //   can_vector_load = true;
-      // }
+
+      // A direct packed int4/uint4 vector load reinterprets the underlying
+      // bytes as one vector carrier, so its logical base must be aligned to
+      // the full vector lane count.
+      if (is_packed_int4_vector) {
+        can_vector_load = IsProvablyDivisible(base.Eval(), value_dtype.lanes());
+      }
     }
 
     if (can_vector_load) {
       std::string ref = GetVecLoad(op->dtype, op->buffer.get(), base.Eval());
       HandleVolatileLoads(ref, op, os);
     } else {
+      if (is_packed_int4_vector && !is_packed_int4x2) {
+        // A packed vector load that cannot use a directly aligned carrier is
+        // still safe to scalarize: loads do not introduce byte-level
+        // read-modify-write races. Load each logical nibble and assemble the
+        // carrier in a temporary.
+        std::string result = name_supply_->FreshName("_");
+        this->PrintIndent();
+        this->PrintType(value_dtype, stream);
+        stream << ' ' << result << ";\n";
+        int ssa_scope = BeginScope();
+        const RampNode *ramp = index.as<RampNode>();
+        std::string sindex;
+        if (ramp == nullptr) {
+          sindex = SSAGetID(PrintExpr(index), index.dtype());
+        }
+        for (int i = 0; i < lanes; ++i) {
+          std::ostringstream lane_index;
+          if (ramp != nullptr) {
+            PrimExpr lane =
+                arith::Analyzer().Simplify(ramp->base + ramp->stride * i);
+            lane_index << PrintExpr(lane);
+          } else {
+            PrintVecElemLoad(sindex, index.dtype(), i, lane_index);
+          }
+          std::ostringstream lane_value;
+          print_packed_int4_load(lane_index.str(), lane_value);
+          PrintVecElemStore(result, value_dtype, i, lane_value.str());
+        }
+        EndScope(ssa_scope);
+        os << result;
+        return;
+      }
       std::ostringstream svalue_expr;
       std::string sindex = SSAGetID(PrintExpr(index), index.dtype());
-      std::string vid = GetVarID(buffer_var.get());
       DataType elem_type = op->dtype.element_of();
       for (int i = 0; i < lanes; ++i) {
         std::ostringstream value_temp;
-        if (!HandleTypeMatch(buffer_var.get(), elem_type)) {
-          value_temp << "((";
-          if (buffer_var.get()->dtype.is_handle()) {
-            auto it = alloc_storage_scope_.find(buffer_var.get());
-            if (it != alloc_storage_scope_.end()) {
-              PrintStorageScope(it->second, value_temp);
-            }
-          }
-          PrintType(elem_type, value_temp);
-          value_temp << "*)" << vid << ')';
+
+        if (is_packed_int4x2) {
+          std::ostringstream lane_index;
+          PrintVecElemLoad(sindex, index.dtype(), i, lane_index);
+          print_packed_int4_load(lane_index.str(), value_temp);
         } else {
-          value_temp << vid;
+          if (!HandleTypeMatch(buffer_var.get(), elem_type)) {
+            value_temp << "((";
+            if (buffer_var.get()->dtype.is_handle()) {
+              auto it = alloc_storage_scope_.find(buffer_var.get());
+              if (it != alloc_storage_scope_.end()) {
+                PrintStorageScope(it->second, value_temp);
+              }
+            }
+            PrintType(elem_type, value_temp);
+            value_temp << "*)" << vid << ')';
+          } else {
+            value_temp << vid;
+          }
+          value_temp << '[';
+          PrintVecElemLoad(sindex, index.dtype(), i, value_temp);
+          value_temp << ']';
         }
-        value_temp << '[';
-        PrintVecElemLoad(sindex, index.dtype(), i, value_temp);
-        value_temp << ']';
+
         PrintVecElemLoadExpr(op->dtype, i, value_temp.str(), svalue_expr);
       }
       os << svalue_expr.str();
@@ -3325,6 +3453,38 @@ void CodeGenTileLangMACA::VisitStmt_(const BufferStoreNode *op) {
   PrimExpr index_expr = op->indices[0];
   Var buffer_var = op->buffer->data;
 
+  const bool is_packed_int4_buffer = (element_dtype == DataType::Int(4) ||
+                                      element_dtype == DataType::UInt(4)) &&
+                                     element_dtype.is_scalar();
+  const bool is_packed_int4_vector = is_packed_int4_buffer &&
+                                     value_dtype.lanes() > 1 &&
+                                     value_dtype.element_of() == element_dtype;
+
+  if (is_packed_int4_buffer && value_dtype.is_scalar()) {
+    std::string idx_str = PrintExpr(index_expr);
+    std::string value = this->PrintExpr(op->value);
+    std::string vid = GetVarID(buffer_var.get());
+    this->PrintIndent();
+    if (element_dtype.is_uint()) {
+      stream << "tl_uint4_packed_store((unsigned char*)" << vid << ", "
+             << idx_str << ", " << value << ");\n";
+    } else {
+      stream << "tl_int4_packed_store((signed char*)" << vid << ", " << idx_str
+             << ", " << value << ");\n";
+    }
+    return;
+  }
+
+  // Check if this is a fp4 packed buffer access
+  auto packed_it = fp4_packed_buffers_.find(buffer_var);
+  if (packed_it != fp4_packed_buffers_.end() && value_dtype.is_scalar()) {
+    std::string idx_str = PrintExpr(index_expr);
+    std::string value = this->PrintExpr(op->value);
+    this->PrintIndent();
+    stream << "tl_fp4_packed_store(" << packed_it->second << ", " << idx_str
+           << ", " << value << ");\n";
+    return;
+  }
   if (value_dtype.lanes() == element_dtype.lanes()) {
     // For scalar fp4 stores to non-packed buffers, use tl_fp4_packed_store
     // to correctly handle nibble-level writes. The /2 in GetBufferRef maps two
@@ -3347,7 +3507,18 @@ void CodeGenTileLangMACA::VisitStmt_(const BufferStoreNode *op) {
   } else {
     arith::PVar<PrimExpr> base;
     int ramp_lanes = value_dtype.lanes() / element_dtype.lanes();
-    if (arith::ramp(base, 1, ramp_lanes).Match(index_expr)) {
+    bool is_unit_stride_ramp =
+        arith::ramp(base, 1, ramp_lanes).Match(index_expr);
+    if (is_packed_int4_vector &&
+        (!is_unit_stride_ramp ||
+         !IsProvablyDivisible(base.Eval(), value_dtype.lanes()))) {
+      LOG(FATAL)
+          << "Packed int4/uint4 vector stores require a unit-stride ramp "
+             "with a logical base provably divisible by the vector lane "
+             "count, but got "
+          << index_expr;
+    }
+    if (is_unit_stride_ramp) {
       std::string value = this->PrintExpr(op->value);
       this->PrintVecStore(op->buffer.get(), value_dtype, base.Eval(), value);
     } else {
@@ -3427,6 +3598,31 @@ void CodeGenTileLangMACA::VisitExpr_(const SelectNode *op, std::ostream &os) {
   os << r_var;
 }
 
+void CodeGenTileLangMACA::VisitExpr_(const NotNode *op, std::ostream &os) {
+  if (!op->dtype.is_fixed_length_vector()) {
+    CodeGenC::VisitExpr_(op, os);
+    return;
+  }
+
+  std::string result = name_supply_->FreshName("_");
+  this->PrintIndent();
+  this->PrintType(op->dtype, stream);
+  stream << ' ' << result << ";\n";
+  int ssa_scope = BeginScope();
+  {
+    std::string value = SSAGetID(PrintExpr(op->a), op->a.dtype());
+    for (int i = 0; i < op->dtype.lanes(); ++i) {
+      std::ostringstream lane;
+      lane << "!bool(";
+      PrintVecElemLoad(value, op->a.dtype(), i, lane);
+      lane << ')';
+      PrintVecElemStore(result, op->dtype, i, lane.str());
+    }
+  }
+  EndScope(ssa_scope);
+  os << result;
+}
+
 void CodeGenTileLangMACA::VisitExpr_(const ShuffleNode *op,
                                      std::ostream &os) { // NOLINT(*)
   // For bfloat16x2 / float16x2 construction from two scalar lanes, emit a
@@ -3484,6 +3680,13 @@ void CodeGenTileLangMACA::VisitExpr_(const ShuffleNode *op,
 void CodeGenTileLangMACA::VisitExpr_(const BroadcastNode *op,
                                      std::ostream &os) { // NOLINT(*)
   int lanes = static_cast<int>(Downcast<IntImm>(op->lanes)->value);
+  if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 4 &&
+      lanes == 2) {
+    std::string value = PrintExpr(op->value);
+    PrintVecConstructor(op->dtype, os);
+    os << '(' << value << ", " << value << ')';
+    return;
+  }
   if ((op->dtype.is_int() || op->dtype.is_uint()) && op->dtype.bits() == 8) {
     const int64_t *p = as_const_int(op->value);
     if (p) {
@@ -3792,6 +3995,15 @@ void CodeGenTileLangMACA::PrintVecElemLoadExpr(DataType t, int i,
                                                const std::string &value,
                                                std::ostream &os) {
   ICHECK_GT(t.lanes(), 1);
+  if ((t.is_int() || t.is_uint()) && t.bits() == 4 && t.lanes() == 2) {
+    if (i == 0) {
+      PrintVecConstructor(t, os);
+      os << '(';
+    }
+    os << value;
+    os << (i == t.lanes() - 1 ? ")" : ",");
+    return;
+  }
   if (t.bits() == 8 && (t.is_int() || t.is_uint())) {
     if (!(t.lanes() == 2 || t.lanes() == 3)) {
       if (i != 0) {

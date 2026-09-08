@@ -38,8 +38,6 @@ def resolve_pass_profile_threshold_ms(pass_configs: Mapping[object, object], key
 # SETUP ENVIRONMENT VARIABLES
 CUTLASS_NOT_FOUND_MESSAGE = "CUTLASS is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang backend."
-COMPOSABLE_KERNEL_NOT_FOUND_MESSAGE = "Composable Kernel is not installed or found in the expected path"
-", which may lead to compilation bugs when utilize tilelang backend."
 TL_TEMPLATE_NOT_FOUND_MESSAGE = "TileLang is not installed or found in the expected path"
 ", which may lead to compilation bugs when utilize tilelang backend."
 TVM_LIBRARY_NOT_FOUND_MESSAGE = "TVM is not installed or found in the expected path"
@@ -359,7 +357,6 @@ class Environment:
 
     # External library include paths
     CUTLASS_INCLUDE_DIR = EnvVar("TL_CUTLASS_PATH", None)
-    COMPOSABLE_KERNEL_INCLUDE_DIR = EnvVar("TL_COMPOSABLE_KERNEL_PATH", None)
 
     # TVM integration
     TVM_PYTHON_PATH = EnvVar("TVM_IMPORT_PYTHON_PATH", None)
@@ -377,6 +374,9 @@ class Environment:
     TILELANG_KERNEL_CACHE_USE_LIB_STAMP = EnvVar(
         "TILELANG_KERNEL_CACHE_USE_LIB_STAMP", "0"
     )  # include native TileLang library content hash in kernel cache keys
+    TILELANG_CACHE_VERIFY_HASH = EnvVar(
+        "TILELANG_CACHE_VERIFY_HASH", "1"
+    )  # verify content hashes of cached binary artifacts at load time (set to 0 to only check file sizes)
     TILELANG_CLEANUP_TEMP_FILES = EnvVar(
         "TILELANG_CLEANUP_TEMP_FILES", "1"
     )  # cleanup temporary compiler files/dirs after compilation (set to 0 to keep for debugging)
@@ -448,6 +448,9 @@ class Environment:
 
     def should_use_kernel_cache_lib_stamp(self) -> bool:
         return str(self.TILELANG_KERNEL_CACHE_USE_LIB_STAMP).lower() in ("1", "true", "yes", "on")
+
+    def should_verify_cache_hash(self) -> bool:
+        return str(self.TILELANG_CACHE_VERIFY_HASH).lower() in ("1", "true", "yes", "on")
 
     def is_autotune_cache_disabled(self) -> bool:
         return self.TILELANG_AUTO_TUNING_DISABLE_CACHE.lower() in ("1", "true", "yes", "on")
@@ -648,14 +651,6 @@ if os.environ.get("TL_CUTLASS_PATH", None) is None:
     else:
         logger.warning(CUTLASS_NOT_FOUND_MESSAGE)
 
-# Initialize COMPOSABLE_KERNEL paths
-if os.environ.get("TL_COMPOSABLE_KERNEL_PATH", None) is None:
-    ck_inc_path = os.path.join(THIRD_PARTY_ROOT, "composable_kernel", "include")
-    if os.path.exists(ck_inc_path):
-        os.environ["TL_COMPOSABLE_KERNEL_PATH"] = env.COMPOSABLE_KERNEL_INCLUDE_DIR = ck_inc_path
-    else:
-        logger.warning(COMPOSABLE_KERNEL_NOT_FOUND_MESSAGE)
-
 # Initialize TL_TEMPLATE_PATH
 if os.environ.get("TL_TEMPLATE_PATH", None) is None:
     tl_template_path = os.path.join(THIRD_PARTY_ROOT, "..", "src")
@@ -666,6 +661,5 @@ if os.environ.get("TL_TEMPLATE_PATH", None) is None:
 
 # Export static variables after initialization.
 CUTLASS_INCLUDE_DIR = env.CUTLASS_INCLUDE_DIR
-COMPOSABLE_KERNEL_INCLUDE_DIR = env.COMPOSABLE_KERNEL_INCLUDE_DIR
 TILELANG_TEMPLATE_PATH = env.TILELANG_TEMPLATE_PATH
 TILELANG_HIP_SAVE_TEMP_FILES = env.TILELANG_HIP_SAVE_TEMP_FILES

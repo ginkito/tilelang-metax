@@ -123,7 +123,7 @@ class LibraryGenerator:
         elif is_hip_target(target):
             from tilelang.rocm.target import target_get_mcpu
 
-            from tilelang.env import COMPOSABLE_KERNEL_INCLUDE_DIR, TILELANG_HIP_SAVE_TEMP_FILES
+            from tilelang.env import TILELANG_HIP_SAVE_TEMP_FILES
 
             src = tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False)  # noqa: SIM115
             libpath = src.name.replace(".cpp", ".so")
@@ -137,9 +137,6 @@ class LibraryGenerator:
                 "--shared",
                 src.name,
                 "-Rpass-analysis=kernel-resource-usage",
-            ]
-            command += [
-                "-I" + COMPOSABLE_KERNEL_INCLUDE_DIR,
             ]
             if TILELANG_HIP_SAVE_TEMP_FILES != "0":
                 command += ["--save-temps", "-g"]

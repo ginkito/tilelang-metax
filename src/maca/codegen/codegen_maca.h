@@ -8,6 +8,7 @@
 #ifndef TVM_TL_TARGET_CODEGEN_MACA_H_
 #define TVM_TL_TARGET_CODEGEN_MACA_H_
 
+#include "support/check.h"
 #include <optional>
 #include <tvm/target/codegen.h>
 #include <tvm/tirx/buffer.h>
@@ -37,8 +38,9 @@ public:
                          std::ostream &os) final; // NOLINT(*)
   void PrintVecBinaryOp(const std::string &op, DataType t, PrimExpr lhs,
                         PrimExpr rhs,
-                        std::ostream &os) final;      // NOLINT(*)
-  void PrintType(DataType t, std::ostream &os) final; // NOLINT(*)
+                        std::ostream &os) final;                // NOLINT(*)
+  void PrintType(DataType t, std::ostream &os) final;           // NOLINT(*)
+  void PrintVecConstructor(DataType t, std::ostream &os) final; // NOLINT(*)
   void PrintVecElemLoad(const std::string &vec, DataType t, int i,
                         std::ostream &os) final; // NOLINT(*)
   void PrintVecElemStore(const std::string &vec, DataType t, int i,
@@ -61,6 +63,7 @@ public:
   void VisitExpr_(const ShuffleNode *op, std::ostream &os) final;
   void VisitExpr_(const MinNode *op, std::ostream &os) final;
   void VisitExpr_(const MaxNode *op, std::ostream &os) final;
+  void VisitExpr_(const NotNode *op, std::ostream &os) final;
   void VisitStmt_(const EvaluateNode *op) final;
   void VisitStmt_(const AllocBufferNode *op) final;
   void VisitStmt_(const AttrStmtNode *op) final;
@@ -161,7 +164,9 @@ private:
   std::unordered_map<const VarNode *, std::string> fragment_layouts;
   std::unordered_map<const VarNode *, IntImm> unroll_factor;
   std::optional<std::tuple<int64_t, int64_t, int64_t>> cluster_dims;
-  std::unordered_map<const VarNode *, std::string> fp4_packed_buffers_;
+  // Physical backing variable name for each packed local FP4 buffer.
+  std::unordered_map<Var, std::string, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>
+      fp4_packed_buffers_;
   friend void PrintConst(const FloatImmNode *op, std::ostream &os,
                          CodeGenTileLangMACA *p);
   void PrintWmmaScope(const std::string &scope, DataType t,
