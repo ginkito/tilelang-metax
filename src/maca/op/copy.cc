@@ -224,8 +224,7 @@ Stmt Copy::LowerMemcpyAsync(const CopyNode &op, const LowerArgs &lower_args,
   Stmt lowered_loop = LowerParallelLoop(
       par_op->GetRoot(), loop_layout, lower_args.thread_index, analyzer,
       lower_args.layout_map, par_op->GetPredicate(lower_args.thread_index),
-      /*parallel_loop=*/true, /*should_vectorize=*/true,
-      par_op->LoopLayoutRequiresPaddingGuard());
+      /*parallel_loop=*/true, par_op->LoopLayoutRequiresPaddingGuard());
 
   auto inject_result = InjectMACAMemcpyAsync(lowered_loop, mbar_handle);
   Stmt memcpy_async_loop = inject_result.stmt;
