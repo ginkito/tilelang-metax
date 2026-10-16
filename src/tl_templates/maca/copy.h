@@ -17,9 +17,11 @@ TL_DEVICE uint2 load_global_64(const void *ptr) {
 TL_DEVICE uint4 load_global_128(const void *ptr) {
   return *reinterpret_cast<const uint4 *>(ptr);
 }
-// load_global_256: Load 256 bits, return ulonglong4
-TL_DEVICE ulonglong4 load_global_256(const void *ptr) {
-  return *reinterpret_cast<const ulonglong4 *>(ptr);
+// load_global_256: Load 256 bits, return the pointee vector type. Accepts
+template <typename T> TL_DEVICE T load_global_256(const T *ptr) {
+  static_assert(sizeof(T) == 32,
+                "tl::load_global_256 requires a 32-byte vector type");
+  return *ptr;
 }
 // Predicated (conditional) versions
 TL_DEVICE uint32_t load_global_32_conditional(const void *ptr, bool pred) {
@@ -40,16 +42,15 @@ TL_DEVICE uint4 load_global_128_conditional(const void *ptr, bool pred) {
   }
   return make_uint4(0u, 0u, 0u, 0u);
 }
-TL_DEVICE ulonglong4 load_global_256_conditional(const void *ptr, bool pred) {
+template <typename T>
+TL_DEVICE T load_global_256_conditional(const T *ptr, bool pred) {
+  static_assert(sizeof(T) == 32,
+                "tl::load_global_256_conditional requires a 32-byte vector "
+                "type");
   if (pred) {
-    return *reinterpret_cast<const ulonglong4 *>(ptr);
+    return *ptr;
   }
-  ulonglong4 zero;
-  zero.x = 0;
-  zero.y = 0;
-  zero.z = 0;
-  zero.w = 0;
-  return zero;
+  return T{};
 }
 
 TL_DEVICE uint32_t load_shared_32(const void *ptr) {
@@ -90,8 +91,10 @@ TL_DEVICE void store_global_128(void *ptr, uint4 value) {
   *reinterpret_cast<uint4 *>(ptr) = value;
 }
 // store_global_256: Store 256 bits
-TL_DEVICE void store_global_256(void *ptr, ulonglong4 value) {
-  *reinterpret_cast<ulonglong4 *>(ptr) = value;
+template <typename T> TL_DEVICE void store_global_256(void *ptr, const T &val) {
+  static_assert(sizeof(T) == 32,
+                "tl::store_global_256 requires a 32-byte vector type");
+  *reinterpret_cast<T *>(ptr) = val;
 }
 // Predicated (conditional) versions
 TL_DEVICE void store_global_32_conditional(void *ptr, uint32_t value,
@@ -110,10 +113,14 @@ TL_DEVICE void store_global_128_conditional(void *ptr, uint4 value, bool pred) {
     *reinterpret_cast<uint4 *>(ptr) = value;
   }
 }
-TL_DEVICE void store_global_256_conditional(void *ptr, ulonglong4 value,
+template <typename T>
+TL_DEVICE void store_global_256_conditional(void *ptr, const T &val,
                                             bool pred) {
+  static_assert(sizeof(T) == 32,
+                "tl::store_global_256_conditional requires a 32-byte vector "
+                "type");
   if (pred) {
-    *reinterpret_cast<ulonglong4 *>(ptr) = value;
+    *reinterpret_cast<T *>(ptr) = val;
   }
 }
 } // namespace tl

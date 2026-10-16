@@ -17,6 +17,10 @@ using namespace tirx;
 namespace maca {
 
 struct Reduce : backend::ReduceLowerer<Reduce> {
+  static bool AllReduceNeedsWorkspace(int reducing_threads, int, Target) {
+    return reducing_threads > 64;
+  }
+
   static bool SupportsFp16Bf16NanReduce(Target target) {
     return TargetIsMaca(target);
   }

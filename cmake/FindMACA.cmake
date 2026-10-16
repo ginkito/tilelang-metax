@@ -29,6 +29,20 @@
 # - MACA_FOUND
 # - MACA_INCLUDE_DIRS
 # - MACA_MACAMCC_LIBRARY
+# - TILELANG_MACA_TOOLKIT_AVAILABLE
+
+set(TILELANG_MACA_TOOLKIT_AVAILABLE OFF CACHE INTERNAL
+    "Whether a MACA SDK is available" FORCE)
+if(NOT APPLE)
+  foreach(_tl_maca_probe_root "$ENV{MACA_PATH}" "/opt/maca")
+    if(IS_DIRECTORY "${_tl_maca_probe_root}" AND
+       EXISTS "${_tl_maca_probe_root}/lib/libmcruntime.so")
+      set(TILELANG_MACA_TOOLKIT_AVAILABLE ON CACHE INTERNAL
+          "Whether a MACA SDK is available" FORCE)
+    endif()
+  endforeach()
+endif()
+unset(_tl_maca_probe_root)
 
 macro(find_maca use_maca)
   set(__use_maca ${use_maca})
